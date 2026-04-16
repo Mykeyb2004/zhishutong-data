@@ -9,12 +9,14 @@ from typing import Iterable
 from xml.etree import ElementTree as ET
 from zipfile import ZipFile
 
+from mapping_rules import MappingRules, load_rules
+
 
 NS = {"a": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
 CELL_RE = re.compile(r"([A-Z]+)(\d+)")
 QUESTION_RE = re.compile(r"^(Q\d+)")
 SUSPICIOUS_LIST_RE = re.compile(r"^\s*\d+(?:\s*([,，;；|/、+])\s*\d+)+\s*$")
-SUSPICIOUS_DOT_LIST_RE = re.compile(r"^\s*\d+(?:\s*[.]\s*\d+){1,}\s*$")
+SUSPICIOUS_DOT_LIST_RE = re.compile(r"^\s*\d+(?:\s*[.]\s*\d+){2,}\s*$")
 
 
 def col_to_idx(col: str) -> int:
@@ -86,8 +88,8 @@ def option_label(header: str) -> str:
     return parts[1].strip() if len(parts) == 2 else normalize_title(header)
 
 
-def question_key(header: str) -> str:
-    match = QUESTION_RE.match(header)
+def question_key(header: str, rules: MappingRules) -> str:
+    match = rules.question_id_regex.match(header)
     return match.group(1) if match else normalize_title(header)
 
 
@@ -113,7 +115,7 @@ class ColumnAnalysis:
 
 
 def analyze_columns(
-    text_rows: list[list[str]], value_rows: list[list[str]]
+    text_rows: list[list[str]], value_rows: list[list[str]], rules: MappingRules
 ) -> tuple[list[ColumnAnalysis], list[tuple[str, str, int, str, str]]]:
     headers = text_rows[0]
     analyses: list[ColumnAnalysis] = []
@@ -136,7 +138,7 @@ def analyze_columns(
 
         non_empty_pairs = [(value, text) for (value, text) in pairs if value or text]
 
-        if column <= "CT":
+        if rules.is_question_header(header):
             for row_idx in range(1, len(text_rows)):
                 value = value_rows[row_idx][idx].strip()
                 if not value:
@@ -144,7 +146,7 @@ def analyze_columns(
                 if (
                     SUSPICIOUS_LIST_RE.match(value)
                     or SUSPICIOUS_DOT_LIST_RE.match(value)
-                ) and column not in {"BO", "BP", "BQ", "BR"}:
+                ):
                     suspicious_cells.append(
                         (
                             column,
@@ -159,17 +161,17 @@ def analyze_columns(
             analyses.append(ColumnAnalysis(column, header, "same", non_empty_pairs))
             continue
 
-        if set(non_empty_pairs).issubset({("0", ""), ("1", "1")}):
+        if set(non_empty_pairs).issubset(rules.binary_flag_pairs):
             analyses.append(ColumnAnalysis(column, header, "binary_flag", non_empty_pairs))
             continue
 
-        if set(non_empty_pairs) == {("-2", "")}:
+        if set(non_empty_pairs) == rules.termination_flag_pairs:
             analyses.append(ColumnAnalysis(column, header, "termination_flag", non_empty_pairs))
             continue
 
-        if "其他，请注明" in header:
+        if rules.is_other_text_header(header):
             others = [(value, text) for value, text in non_empty_pairs if value != "0"]
-            if all(value == text and value.startswith("1") for value, text in others):
+            if all(value == text and rules.selected_other_prefix(value) for value, text in others):
                 analyses.append(ColumnAnalysis(column, header, "other_prefixed_text", non_empty_pairs))
                 continue
 
@@ -190,6 +192,7 @@ def build_report(
     value_rows: list[list[str]],
     analyses: list[ColumnAnalysis],
     suspicious_cells: list[tuple[str, str, int, str, str]],
+    rules: MappingRules,
 ) -> str:
     headers = text_rows[0]
     total_rows = len(text_rows) - 1
@@ -207,7 +210,7 @@ def build_report(
 
     for item in analyses:
         if item.kind == "binary_flag":
-            question_binary_groups[question_key(item.header)].append(item)
+            question_binary_groups[question_key(item.header, rules)].append(item)
         elif item.kind == "coded_mapping":
             coded_mappings.append(item)
         elif item.kind == "other_prefixed_text":
@@ -243,7 +246,7 @@ def build_report(
             f"`{value}` -> `{text}`" for value, text in sort_mapping_items(item.mappings)
         )
         lines.append(
-            f"- `{item.column}` / `{question_key(item.header)}` / `{normalize_title(item.header)}`：{mapping_text}"
+            f"- `{item.column}` / `{question_key(item.header, rules)}` / `{normalize_title(item.header)}`：{mapping_text}"
         )
 
     lines.append("")
@@ -295,7 +298,7 @@ def build_report(
         lines.append("")
         for column, submit_id, row_number, header, value in suspicious_cells:
             lines.append(
-                f"- 行 `{row_number}` / 提交序号 `{submit_id}` / 列 `{column}` / `{question_key(header)}`：`{value}`"
+                f"- 行 `{row_number}` / 提交序号 `{submit_id}` / 列 `{column}` / `{question_key(header, rules)}`：`{value}`"
             )
     else:
         lines.append("- 没发现疑似“一个单元格内保存多编码”的答案。")
@@ -310,7 +313,7 @@ def build_report(
         "- 如果后续你想把这两份表合并成一份更好分析的标准表，我建议把多选题统一转成长表或布尔列。"
     )
     lines.append(
-        "- `Q23` 这 6 条可疑编码串，最好结合问卷原始题库/访问员说明再确认它们是不是手工记号。"
+        f"- 当前共识别出 {len(suspicious_cells)} 条可疑编码串，最好结合问卷原始题库/访问员说明再确认它们是不是手工记号。"
     )
     lines.append("")
     return "\n".join(lines)
@@ -325,7 +328,9 @@ def main() -> None:
         default=Path("docs/questionnaire_mapping_report.md"),
         type=Path,
     )
+    parser.add_argument("--rules", default=None, type=Path)
     args = parser.parse_args()
+    rules = load_rules(args.rules)
 
     text_rows = load_xlsx(args.text)
     value_rows = load_xlsx(args.value)
@@ -334,7 +339,7 @@ def main() -> None:
     if text_rows[0] != value_rows[0]:
         raise ValueError("两份文件列头不一致")
 
-    analyses, suspicious_cells = analyze_columns(text_rows, value_rows)
+    analyses, suspicious_cells = analyze_columns(text_rows, value_rows, rules)
     report = build_report(
         text_path=args.text,
         value_path=args.value,
@@ -342,6 +347,7 @@ def main() -> None:
         value_rows=value_rows,
         analyses=analyses,
         suspicious_cells=suspicious_cells,
+        rules=rules,
     )
     args.report.write_text(report, encoding="utf-8")
     print(f"报告已生成：{args.report}")

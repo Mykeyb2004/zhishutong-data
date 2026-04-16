@@ -47,7 +47,7 @@ def col_to_idx(col: str) -> int:
     return value - 1
 
 
-def read_xlsx_sheet(path: Path, sheet_name: str) -> list[list[str]]:
+def read_xlsx_sheet(path: Path, sheet_name: str | None = None) -> list[list[str]]:
     with ZipFile(path) as workbook:
         try:
             shared_root = ET.fromstring(workbook.read("xl/sharedStrings.xml"))
@@ -66,14 +66,24 @@ def read_xlsx_sheet(path: Path, sheet_name: str) -> list[list[str]]:
             )
         }
 
-        target = None
-        for sheet in workbook_root.find("a:sheets", NS):
-            if sheet.attrib["name"] == sheet_name:
-                rel_id = sheet.attrib[
+        sheets = list(workbook_root.find("a:sheets", NS))
+        if sheet_name is None:
+            if not sheets:
+                raise ValueError(f"{path} 中没有可读取的 sheet")
+            target = rel_map[
+                sheets[0].attrib[
                     "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
                 ]
-                target = rel_map[rel_id]
-                break
+            ]
+        else:
+            target = None
+            for sheet in sheets:
+                if sheet.attrib["name"] == sheet_name:
+                    rel_id = sheet.attrib[
+                        "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
+                    ]
+                    target = rel_map[rel_id]
+                    break
         if target is None:
             raise ValueError(f"{path} 中不存在 sheet: {sheet_name}")
 
@@ -335,6 +345,40 @@ def preview_rows(df: pd.DataFrame, columns: list[str], limit: int = 5) -> list[l
     return records
 
 
+def choose_preview_columns(specs: list[VariableSpec], df: pd.DataFrame) -> list[str]:
+    role_priority = [
+        "meta",
+        "single",
+        "multi_binary",
+        "multi_other_flag",
+        "multi_other_text",
+        "open_text",
+        "open_numeric",
+        "flow",
+    ]
+    chosen: list[str] = []
+    seen: set[str] = set()
+    kept_specs = [spec for spec in specs if spec.keep and spec.spss_name in df.columns]
+
+    for role in role_priority:
+        for spec in kept_specs:
+            if spec.role != role or spec.spss_name in seen:
+                continue
+            chosen.append(spec.spss_name)
+            seen.add(spec.spss_name)
+            break
+
+    for spec in kept_specs:
+        if spec.spss_name in seen:
+            continue
+        chosen.append(spec.spss_name)
+        seen.add(spec.spss_name)
+        if len(chosen) >= 8:
+            break
+
+    return chosen[:8]
+
+
 def write_preview_report(
     path: Path,
     sav_path: Path,
@@ -345,20 +389,7 @@ def write_preview_report(
     metadata: Any,
 ) -> None:
     kept_specs = [spec for spec in specs if spec.keep and spec.spss_name in df.columns]
-    key_names = [
-        name
-        for name in [
-            "meta_submit_id",
-            "q06_gender",
-            "q13_brand_main",
-            "q20_01",
-            "q20_99",
-            "q20_99_text",
-            "q23_like_reason_text",
-            "q34_occupation",
-        ]
-        if name in df.columns
-    ]
+    key_names = choose_preview_columns(specs, df)
     preview = preview_rows(df, key_names) if key_names else []
 
     lines = [
@@ -406,12 +437,13 @@ def write_preview_report(
 def main() -> None:
     parser = argparse.ArgumentParser(description="将现有问卷 Excel 转换为 SAV")
     parser.add_argument("--data", type=Path, default=Path("data-value.xlsx"))
+    parser.add_argument("--sheet", type=str, default=None)
     parser.add_argument("--mapping", type=Path, default=Path("docs/sav_mapping_template.xlsx"))
     parser.add_argument("--output", type=Path, default=Path("data-value.converted.sav"))
     parser.add_argument("--preview", type=Path, default=Path("docs/sav_conversion_preview.md"))
     args = parser.parse_args()
 
-    source_rows = read_xlsx_sheet(args.data, "问卷数据")
+    source_rows = read_xlsx_sheet(args.data, args.sheet)
     specs = load_variable_specs(args.mapping)
     value_labels = load_value_labels(args.mapping)
 

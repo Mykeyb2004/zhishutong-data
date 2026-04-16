@@ -1,0 +1,11 @@
+.uv-cache/
+__pycache__/
+*.py[cod]
+*$py.class
+
+.DS_Store
+~$*.xlsx
+
+data-text.xlsx
+data-value.xlsx
+data-value.converted.sav

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
-import re
 from xml.sax.saxutils import escape
 from zipfile import ZIP_DEFLATED, ZipFile
 
@@ -17,64 +17,12 @@ from analyze_questionnaire_mapping import (
     option_label,
     question_key,
 )
+from mapping_rules import MappingRules, load_rules
 
 
 NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
 NS_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-
-FLOW_COLUMNS = {"J", "Q", "T", "Z", "AD"}
-META_COLUMNS = {"A", "B", "CU", "CV", "CW", "CX", "CY", "CZ", "DA", "DB", "DC", "DD", "DE", "DF", "DG", "DH"}
-META_STRING_COLUMNS = {"B", "CU", "CW", "CX", "CY", "CZ", "DA", "DB", "DE", "DG", "DH"}
-META_NUMERIC_COLUMNS = {"A", "CV", "DC", "DD", "DF"}
-LIKERT_ORDINAL_COLUMNS = {"S", "AF", "AS", "BJ", "BM", "BN", "BX", "BY"}
-SINGLE_NAME_MAP = {
-    "A": "meta_submit_id",
-    "B": "meta_status",
-    "J": "q03_terminate_flag",
-    "Q": "q05_terminate_flag",
-    "R": "q06_gender",
-    "S": "q07_age_band",
-    "T": "q08_terminate_flag",
-    "Z": "q10_terminate_flag",
-    "AD": "q12_terminate_flag",
-    "AE": "q13_brand_main",
-    "AF": "q15_drink_frequency",
-    "AS": "q17_price_band",
-    "AT": "q18_taste_preference",
-    "AU": "q19_attention_text",
-    "BJ": "q22_like_level",
-    "BK": "q23_like_reason_text",
-    "BL": "q24_dislike_reason_text",
-    "BM": "q25_uniqueness",
-    "BN": "q26_purchase_intent",
-    "BO": "q27a_price_too_low",
-    "BP": "q27b_price_bargain",
-    "BQ": "q27c_price_high_ok",
-    "BR": "q27d_price_too_high",
-    "BS": "q28_preferred_beer",
-    "BT": "q29_preferred_beer_reason_text",
-    "BU": "q31_preferred_opening",
-    "BV": "q32_preferred_opening_reason_text",
-    "BW": "q34_occupation",
-    "BX": "q35_education",
-    "BY": "q36_household_income",
-    "BZ": "q37_living_status",
-    "CT": "q39_end_flag",
-    "CU": "meta_extended_field",
-    "CV": "meta_user_id",
-    "CW": "meta_update_user",
-    "CX": "meta_submit_time",
-    "CY": "meta_update_time",
-    "CZ": "meta_audio_url",
-    "DA": "meta_duration",
-    "DB": "meta_start_time",
-    "DC": "meta_pending_task_id",
-    "DD": "meta_last_review_task_id",
-    "DE": "meta_hierarchy_path",
-    "DF": "meta_pending_user",
-    "DG": "meta_address",
-    "DH": "meta_username",
-}
+NUMERIC_RE = re.compile(r"-?\d+(?:\.\d+)?")
 
 
 @dataclass
@@ -102,67 +50,169 @@ def build_question_label(header: str) -> str:
     return normalized
 
 
+def parse_number(text: str) -> float | int | None:
+    value = text.strip()
+    if not value or not NUMERIC_RE.fullmatch(value):
+        return None
+    number = float(value)
+    return int(number) if number.is_integer() else number
+
+
+def numeric_ratio(values: list[str]) -> float:
+    cleaned = [value.strip() for value in values if value.strip()]
+    if not cleaned:
+        return 0.0
+    numeric_count = sum(1 for value in cleaned if parse_number(value) is not None)
+    return numeric_count / len(cleaned)
+
+
+def has_mixed_numeric_and_text(values: list[str]) -> bool:
+    cleaned = [value.strip() for value in values if value.strip()]
+    if not cleaned:
+        return False
+    has_numeric = any(parse_number(value) is not None for value in cleaned)
+    has_text = any(parse_number(value) is None for value in cleaned)
+    return has_numeric and has_text
+
+
+def codes_are_numeric(pairs: list[tuple[str, str]]) -> bool:
+    if not pairs:
+        return False
+    return all(parse_number(code) is not None for code, _ in pairs)
+
+
 def split_other_prefixed(value: str) -> str:
     if value.startswith("1"):
         return value[1:].strip()
     return value.strip()
 
 
-def codes_are_numeric(pairs: list[tuple[str, str]]) -> bool:
-    if not pairs:
-        return False
-    return all(re.fullmatch(r"-?\d+(?:\.\d+)?", code) for code, _ in pairs)
+def extract_subquestion_token(header: str, rules: MappingRules) -> str:
+    matches = rules.extract_subquestion_tokens(header)
+    if matches:
+        return matches[-1].lower()
+    return ""
 
 
-def multi_option_base_name(question_id: str, option_idx: int, option_text: str) -> str:
+def ensure_unique_name(base: str, used_names: set[str]) -> str:
+    candidate = base
+    counter = 2
+    while candidate in used_names:
+        candidate = f"{base}_{counter}"
+        counter += 1
+    used_names.add(candidate)
+    return candidate
+
+
+def infer_name(
+    question_id: str,
+    role: str,
+    column: str,
+    header: str,
+    used_names: set[str],
+    rules: MappingRules,
+) -> str:
+    if question_id == "META":
+        return ensure_unique_name(f"meta_{column.lower()}", used_names)
+
+    base = question_id.lower()
+    if role == "flow":
+        base = f"{base}_flow"
+    elif role == "open_text":
+        base = f"{base}_text"
+    elif role == "open_numeric":
+        token = extract_subquestion_token(header, rules)
+        base = f"{base}_{token}" if token else f"{base}_num"
+    return ensure_unique_name(base, used_names)
+
+
+def infer_role_and_type(
+    analysis: ColumnAnalysis,
+    header: str,
+    raw_values: list[str],
+    is_question: bool,
+    rules: MappingRules,
+) -> tuple[str, str]:
+    number_ratio = numeric_ratio(raw_values)
+    mixed_numeric_text = has_mixed_numeric_and_text(raw_values)
+
+    if not is_question:
+        return "meta", ("string" if mixed_numeric_text else ("numeric" if number_ratio == 1.0 and raw_values else "string"))
+
+    if analysis.kind == "termination_flag":
+        return "flow", "numeric"
+
+    if analysis.kind == "coded_mapping":
+        return "single", ("numeric" if codes_are_numeric(analysis.mappings) else "string")
+
+    if analysis.kind == "same":
+        if rules.is_open_text_header(header):
+            return ("open_text", "string") if mixed_numeric_text else (("open_numeric", "numeric") if number_ratio >= 0.7 else ("open_text", "string"))
+        if mixed_numeric_text:
+            return "open_text", "string"
+        return ("single", "numeric") if number_ratio == 1.0 and raw_values else ("open_text", "string")
+
+    if analysis.kind == "mixed_or_open":
+        return ("open_text", "string") if mixed_numeric_text else (("open_numeric", "numeric") if number_ratio >= 0.7 else ("open_text", "string"))
+
+    if mixed_numeric_text:
+        return "single", "string"
+    return "single", ("numeric" if number_ratio == 1.0 and raw_values else "string")
+
+
+def multi_option_base_name(
+    question_id: str,
+    option_idx: int,
+    option_text: str,
+    rules: MappingRules,
+) -> str:
     prefix = question_id.lower()
-    if "其他" in option_text:
+    if rules.is_other_text_header(option_text):
         return f"{prefix}_99"
-    if "以上均无" in option_text or "都没有喝过" in option_text:
+    if rules.is_none_of_above(option_text):
         return f"{prefix}_98"
     return f"{prefix}_{option_idx:02d}"
 
 
-def suggest_measure(column: str, role: str, spss_name: str) -> str:
-    if role in {"open_text", "meta"}:
-        return "nominal"
-    if role in {"multi_binary", "multi_other_flag"}:
-        return "nominal"
-    if column in LIKERT_ORDINAL_COLUMNS:
-        return "ordinal"
-    if column in {"BO", "BP", "BQ", "BR"}:
+def suggest_measure(role: str) -> str:
+    if role == "open_numeric":
         return "scale"
-    if spss_name in {"q06_gender", "q13_brand_main", "q18_taste_preference", "q28_preferred_beer", "q31_preferred_opening", "q34_occupation", "q37_living_status"}:
-        return "nominal"
-    if spss_name == "q39_end_flag":
-        return "nominal"
     return "nominal"
 
 
-def suggest_keep(column: str, role: str, spss_name: str) -> str:
-    if column in FLOW_COLUMNS:
-        return "0"
-    if spss_name in {"meta_status", "meta_extended_field", "meta_update_user", "meta_pending_task_id", "meta_last_review_task_id", "meta_hierarchy_path", "meta_pending_user", "meta_audio_url"}:
-        return "0"
-    return "1"
+def suggest_keep(role: str) -> str:
+    return "0" if role == "flow" else "1"
 
 
-def build_variable_rows(analyses: list[ColumnAnalysis], headers: list[str]) -> list[VariableRow]:
+def build_variable_rows(
+    analyses: list[ColumnAnalysis],
+    headers: list[str],
+    value_rows: list[list[str]],
+    rules: MappingRules,
+) -> list[VariableRow]:
     analysis_by_col = {item.column: item for item in analyses}
     multi_positions: dict[str, int] = {}
+    used_names: set[str] = set()
     rows: list[VariableRow] = []
 
     for idx, header in enumerate(headers):
         column = idx_to_col(idx)
         analysis = analysis_by_col[column]
         normalized = normalize_title(header)
-        qid = question_key(header) if header.startswith("Q") else "META"
+        qid = question_key(header, rules) if rules.is_question_header(header) else "META"
         qlabel = build_question_label(header)
+        raw_values = [
+            row[idx] if idx < len(row) else ""
+            for row in value_rows[1:]
+        ]
 
         if analysis.kind == "binary_flag":
             option_text = option_label(header)
             multi_positions[qid] = multi_positions.get(qid, 0) + 1
-            base_name = multi_option_base_name(qid, multi_positions[qid], option_text)
+            base_name = ensure_unique_name(
+                multi_option_base_name(qid, multi_positions[qid], option_text, rules),
+                used_names,
+            )
             rows.append(
                 VariableRow(
                     source_col=column,
@@ -173,9 +223,9 @@ def build_variable_rows(analyses: list[ColumnAnalysis], headers: list[str]) -> l
                     spss_name=base_name,
                     variable_label=normalized,
                     var_type="numeric",
-                    measure=suggest_measure(column, "multi_binary", base_name),
+                    measure=suggest_measure("multi_binary"),
                     role="multi_binary",
-                    keep=suggest_keep(column, "multi_binary", base_name),
+                    keep=suggest_keep("multi_binary"),
                     missing_rule="",
                     transform_rule="copy_as_numeric_0_1",
                     notes="多选题拆列；0=未选，1=选中",
@@ -186,7 +236,10 @@ def build_variable_rows(analyses: list[ColumnAnalysis], headers: list[str]) -> l
         if analysis.kind == "other_prefixed_text":
             option_text = option_label(header)
             multi_positions[qid] = multi_positions.get(qid, 0) + 1
-            base_name = multi_option_base_name(qid, multi_positions[qid], option_text)
+            base_name = ensure_unique_name(
+                multi_option_base_name(qid, multi_positions[qid], option_text, rules),
+                used_names,
+            )
             rows.append(
                 VariableRow(
                     source_col=column,
@@ -195,11 +248,11 @@ def build_variable_rows(analyses: list[ColumnAnalysis], headers: list[str]) -> l
                     question_label=qlabel,
                     option_label=option_text,
                     spss_name=base_name,
-                    variable_label=f"{qlabel}_其他是否填写",
+                    variable_label=f"{normalized}_是否填写",
                     var_type="numeric",
-                    measure=suggest_measure(column, "multi_other_flag", base_name),
+                    measure=suggest_measure("multi_other_flag"),
                     role="multi_other_flag",
-                    keep="1",
+                    keep=suggest_keep("multi_other_flag"),
                     missing_rule="",
                     transform_rule="derive_1_if_value_not_in['','0']_else_0",
                     notes="由原始的 `1文本` 形式派生为二值变量",
@@ -212,12 +265,12 @@ def build_variable_rows(analyses: list[ColumnAnalysis], headers: list[str]) -> l
                     question_id=qid,
                     question_label=qlabel,
                     option_label=f"{option_text}_文本",
-                    spss_name=f"{base_name}_text",
-                    variable_label=f"{qlabel}_其他文本",
+                    spss_name=ensure_unique_name(f"{base_name}_text", used_names),
+                    variable_label=f"{normalized}_填写文本",
                     var_type="string",
-                    measure="nominal",
+                    measure=suggest_measure("multi_other_text"),
                     role="multi_other_text",
-                    keep="1",
+                    keep=suggest_keep("multi_other_text"),
                     missing_rule="",
                     transform_rule="strip_leading_1_when_present",
                     notes=f"示例：`1KTV` -> `{split_other_prefixed('1KTV')}`",
@@ -225,28 +278,13 @@ def build_variable_rows(analyses: list[ColumnAnalysis], headers: list[str]) -> l
             )
             continue
 
-        spss_name = SINGLE_NAME_MAP.get(column, f"{qid.lower()}_{column.lower()}")
-        role = "meta" if column in META_COLUMNS or not header.startswith("Q") else "single"
-        if column in META_STRING_COLUMNS:
-            var_type = "string"
-        elif column in META_NUMERIC_COLUMNS:
-            var_type = "numeric"
-        elif "开放题" in normalized:
-            var_type = "string"
-        else:
-            var_type = "numeric"
-        if column in {"BO", "BP", "BQ", "BR"}:
-            var_type = "numeric"
-            role = "open_numeric"
-        if analysis.kind == "coded_mapping" and not codes_are_numeric(analysis.mappings):
-            var_type = "string"
-        if analysis.kind == "termination_flag":
-            role = "flow"
-            var_type = "numeric"
-        if analysis.kind == "same" and "开放题" in normalized and column not in {"BO", "BP", "BQ", "BR"}:
-            role = "open_text"
-            var_type = "string"
-
+        role, var_type = infer_role_and_type(
+            analysis=analysis,
+            header=normalized,
+            raw_values=raw_values,
+            is_question=rules.is_question_header(header),
+            rules=rules,
+        )
         rows.append(
             VariableRow(
                 source_col=column,
@@ -254,12 +292,12 @@ def build_variable_rows(analyses: list[ColumnAnalysis], headers: list[str]) -> l
                 question_id=qid,
                 question_label=qlabel,
                 option_label="",
-                spss_name=spss_name,
-                variable_label=qlabel,
+                spss_name=infer_name(qid, role, column, normalized, used_names, rules),
+                variable_label=normalized,
                 var_type=var_type,
-                measure=suggest_measure(column, role, spss_name),
+                measure=suggest_measure(role),
                 role=role,
-                keep=suggest_keep(column, role, spss_name),
+                keep=suggest_keep(role),
                 missing_rule="-2=user_missing" if analysis.kind == "termination_flag" else "",
                 transform_rule="copy_raw_value",
                 notes="",
@@ -300,11 +338,10 @@ def build_mrsets(variable_rows: list[VariableRow]) -> list[list[str]]:
     mrsets: list[list[str]] = []
     for question_id, items in sorted(grouped.items()):
         items.sort(key=lambda item: item.spss_name)
-        question_label = items[0].question_label
         mrsets.append(
             [
                 f"{question_id.lower()}_mr",
-                question_label,
+                items[0].question_label,
                 question_id,
                 "multiple_dichotomy",
                 "1",
@@ -322,6 +359,11 @@ def readme_rows() -> list[list[str]]:
         ["variables", "一行代表一个输出到 SAV 的变量；可由同一 source_col 派生多个变量"],
         ["value_labels", "为 categorical 变量补充值标签"],
         ["mrsets", "为多选题预留 Multiple Response Set 定义"],
+        ["", ""],
+        ["原则", "说明"],
+        ["自动命名", "默认按 question_id / 列角色推断，例如 q13、q23_text、q20_01"],
+        ["自动类型", "默认根据列值和映射关系推断 numeric/string，可人工调整"],
+        ["自动保留", "除 flow 变量外默认 keep=1，可人工修改"],
         ["", ""],
         ["字段", "说明"],
         ["source_col", "原始 Excel 列号"],
@@ -476,16 +518,18 @@ def main() -> None:
     parser.add_argument("--text", type=Path, default=Path("data-text.xlsx"))
     parser.add_argument("--value", type=Path, default=Path("data-value.xlsx"))
     parser.add_argument("--output", type=Path, default=Path("docs/sav_mapping_template.xlsx"))
+    parser.add_argument("--rules", default=None, type=Path)
     args = parser.parse_args()
+    rules = load_rules(args.rules)
 
     text_rows = load_xlsx(args.text)
     value_rows = load_xlsx(args.value)
     if text_rows[0] != value_rows[0]:
         raise ValueError("文本版与数值版列头不一致")
 
-    analyses, _ = analyze_columns(text_rows, value_rows)
+    analyses, _ = analyze_columns(text_rows, value_rows, rules)
     headers = text_rows[0]
-    variable_rows = build_variable_rows(analyses, headers)
+    variable_rows = build_variable_rows(analyses, headers, value_rows, rules)
 
     variables_sheet = [[
         "source_col",

@@ -1,0 +1,27 @@
+{
+  "question_id_regex": "^(Q\\d+)",
+  "question_header_patterns": [
+    "^(Q\\d+)"
+  ],
+  "subquestion_token_regex": "([0-9]+[A-Za-z])[:：]",
+  "binary_flag_pairs": [
+    ["0", ""],
+    ["1", "1"]
+  ],
+  "termination_flag_pairs": [
+    ["-2", ""]
+  ],
+  "open_text_keywords": [
+    "开放题"
+  ],
+  "other_text_keywords": [
+    "其他，请注明"
+  ],
+  "none_of_above_keywords": [
+    "以上均无",
+    "都没有喝过"
+  ],
+  "other_text_selected_prefixes": [
+    "1"
+  ]
+}
